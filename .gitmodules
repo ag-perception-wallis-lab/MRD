@@ -1,0 +1,4 @@
+[submodule "vendor/model-vs-human"]
+	path = vendor/model-vs-human
+	url = https://github.com/pixelsandpointers/model-vs-human
+	branch = update-deps
