@@ -57,25 +57,35 @@ class ModelMixin(ABC):
 
     @abstractmethod
     def __str__(self) -> str:
-        raise NotImplementedError('Implement this in your own model.')
+        raise NotImplementedError("Implement this in your own model.")
 
     @abstractmethod
     def lossfn(self, render: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError('Implement this in your own model.')
+        raise NotImplementedError("Implement this in your own model.")
 
     @abstractmethod
     def __call__(self, render: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError('Implement this in your own model.')
+        raise NotImplementedError("Implement this in your own model.")
 
     @torch.no_grad()
-    def spearman(self, render, target, ties: bool = False):
-        latent = self(render)
-        return spearman_correlation(latent, target, ties)
+    def spearman(
+        self, render: torch.Tensor, target: torch.Tensor, image_based: bool = False
+    ):
+        if image_based:
+            if not torch.is_tensor(target):
+                target = target.torch().permute(2, 0, 1).contiguous()
+            return spearman_correlation(render, target)
+        return spearman_correlation(render, target)
 
     @torch.no_grad()
-    def pearson(self, render, target):
-        latent = self(render)
-        return pearson_correlation(latent, target)
+    def pearson(
+        self, render: torch.Tensor, target: torch.Tensor, image_based: bool = False
+    ):
+        if image_based:
+            if not torch.is_tensor(target):
+                target = target.torch().permute(2, 0, 1).contiguous()
+            return pearson_correlation(render, target)
+        return pearson_correlation(render, target)
 
     @torch.no_grad()
     def l2(self, render: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -115,6 +125,18 @@ class MAE(ModelMixin):
 
     def __call__(self, render: torch.Tensor, target: torch.Tensor):
         return dr.mean(dr.abs(render - target))
+
+    def lossfn(self, render, target):
+        return self.__call__(render, target)
+
+class MSE(ModelMixin):
+    is_torch: bool = False
+
+    def __str__(self):
+        return "MSE"
+
+    def __call__(self, render: torch.Tensor, target: torch.Tensor):
+        return dr.mean(dr.square(render - target))
 
     def lossfn(self, render, target):
         return self.__call__(render, target)
@@ -588,14 +610,6 @@ class LPIPS(ModelMixin):
         )
 
     @torch.no_grad()
-    def spearman(self, render, target, ties: bool = False):
-        raise RuntimeError("Cannot compute stats on LPIPS")
-
-    @torch.no_grad()
-    def pearson(self, render, target):
-        raise RuntimeError("Cannot compute stats on LPIPS")
-
-    @torch.no_grad()
     def l2(self, render: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Cannot compute stats on LPIPS")
 
@@ -621,14 +635,6 @@ class LPIPSVGG(ModelMixin):
         )
 
     @torch.no_grad()
-    def spearman(self, render, target, ties: bool = False):
-        raise RuntimeError("Cannot compute stats on LPIPS")
-
-    @torch.no_grad()
-    def pearson(self, render, target):
-        raise RuntimeError("Cannot compute stats on LPIPS")
-
-    @torch.no_grad()
     def l2(self, render: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Cannot compute stats on LPIPS")
 
@@ -641,363 +647,8 @@ class LPIPSVGG(ModelMixin):
         return sum(res) / len(res)
 
 
-class LaplacianLoss(ModelMixin):
-    """
-    Laplacian smoothing loss
-    Penalizes deviations of each vertex from the average position of its neighboring vertices.
-    ℒ_lap = 1/|V| ∑(i=1 to |V|) ||v_i - 1/|𝒩(i)| ∑(j∈𝒩(i)) v_j||²
-    """
-
-    is_torch: bool = False
-
-    def __init__(self):
-        super().__init__()
-        self.adjacency_list = None
-        self.vertex_indices = None
-        self.neighbor_counts = None
-
-    def __str__(self):
-        return "LaplacianLoss"
-
-    def build_adjacency(self, faces: mi.UInt, num_vertices: int):
-        """Build vertex adjacency structure from faces."""
-        faces_np = faces.numpy().reshape(-1, 3).astype(np.int32)
-        adjacency = [set() for _ in range(num_vertices)]
-
-        for face in faces_np:
-            i, j, k = face
-            adjacency[i].update([j, k])
-            adjacency[j].update([i, k])
-            adjacency[k].update([i, j])
-
-        # Convert to flat arrays for efficient DrJit gathering
-        vertex_indices = []
-        neighbor_starts = [0]
-        neighbor_indices = []
-        neighbor_counts = []
-
-        for i in range(num_vertices):
-            neighbors = sorted(list(adjacency[i]))
-            neighbor_counts.append(len(neighbors))
-            neighbor_indices.extend(neighbors)
-            neighbor_starts.append(len(neighbor_indices))
-
-        self.vertex_indices = mi.UInt(np.arange(num_vertices, dtype=np.uint32))
-        self.neighbor_starts = np.array(neighbor_starts[:-1], dtype=np.int32)
-        self.neighbor_ends = np.array(neighbor_starts[1:], dtype=np.int32)
-        self.neighbor_indices = mi.UInt(np.array(neighbor_indices, dtype=np.uint32))
-        self.neighbor_counts = mi.Float(np.array(neighbor_counts, dtype=np.float32))
-        self.num_vertices = num_vertices
-
-    def __call__(self, vertices: mi.Float, faces: mi.UInt = None):
-        """
-        vertices: flattened vertex positions (num_vertices * 3,)
-        faces: flattened face indices (num_faces * 3,) - only needed for initialization
-        """
-        if self.adjacency_list is None:
-            if faces is None:
-                raise ValueError("Must provide faces for first call")
-            num_verts = len(vertices) // 3
-            self.build_adjacency(faces, num_verts)
-
-        # Reshape vertices to (num_vertices, 3)
-        verts = mi.Float(vertices)
-
-        # Compute loss for each vertex
-        total_loss = mi.Float(0.0)
-
-        for i in range(self.num_vertices):
-            # Get neighbors for this vertex
-            start = self.neighbor_starts[i]
-            end = self.neighbor_ends[i]
-            n_neighbors = end - start
-
-            if n_neighbors == 0:
-                continue
-
-            # Current vertex position
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-
-            # Compute mean of neighbor positions
-            neighbor_sum = mi.Vector3f(0.0, 0.0, 0.0)
-            for idx in range(start, end):
-                j = int(self.neighbor_indices[idx])
-                v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-                neighbor_sum += v_j
-
-            neighbor_mean = neighbor_sum / float(n_neighbors)
-
-            # Compute squared deviation
-            diff = v_i - neighbor_mean
-            total_loss += dr.dot(diff, diff)
-
-        return total_loss / float(self.num_vertices)
-
-    def lossfn(self, vertices: mi.Float, faces: mi.UInt = None):
-        return self(vertices, faces)
-
-
-class EdgeLengthLoss(ModelMixin):
-    """
-    Uniform edge length loss
-    Discourages disproportionate edge lengths by penalizing variance around the mean edge length.
-    ℒ_edge = 1/|E| ∑((i,j)∈E) (||v_i - v_j|| - ℓ̄)²
-    """
-
-    is_torch: bool = False
-
-    def __init__(self):
-        super().__init__()
-        self.edges = None
-
-    def __str__(self):
-        return "EdgeLengthLoss"
-
-    def build_edges(self, faces: mi.UInt):
-        """Extract unique edges from faces."""
-        faces_np = faces.numpy().reshape(-1, 3).astype(np.int32)
-
-        edges = set()
-        for face in faces_np:
-            i, j, k = face
-            edges.add(tuple(sorted([i, j])))
-            edges.add(tuple(sorted([j, k])))
-            edges.add(tuple(sorted([k, i])))
-
-        edges = np.array(list(edges), dtype=np.uint32)
-        self.edge_i = mi.UInt(edges[:, 0])
-        self.edge_j = mi.UInt(edges[:, 1])
-        self.num_edges = len(edges)
-
-    def __call__(self, vertices: mi.Float, faces: mi.UInt = None):
-        """
-        vertices: flattened vertex positions (num_vertices * 3,)
-        faces: flattened face indices (num_faces * 3,) - only needed for initialization
-        """
-        if self.edges is None:
-            if faces is None:
-                raise ValueError("Must provide faces for first call")
-            self.build_edges(faces)
-
-        verts = mi.Float(vertices)
-
-        # Compute all edge lengths
-        edge_lengths = mi.Float(0.0)
-        length_sum = mi.Float(0.0)
-
-        for idx in range(self.num_edges):
-            i = int(self.edge_i[idx])
-            j = int(self.edge_j[idx])
-
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-            v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-
-            edge_vec = v_j - v_i
-            length = dr.norm(edge_vec)
-            length_sum += length
-
-        mean_length = length_sum / float(self.num_edges)
-
-        # Compute variance
-        variance = mi.Float(0.0)
-        for idx in range(self.num_edges):
-            i = int(self.edge_i[idx])
-            j = int(self.edge_j[idx])
-
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-            v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-
-            edge_vec = v_j - v_i
-            length = dr.norm(edge_vec)
-            diff = length - mean_length
-            variance += diff * diff
-
-        return variance / float(self.num_edges)
-
-    def lossfn(self, vertices: mi.Float, faces: mi.UInt = None):
-        return self(vertices, faces)
-
-
-class TriangleAreaLoss(ModelMixin):
-    """
-    Triangle area loss
-    Enforces uniformity in triangular face sizes by penalizing area variance.
-    ℒ_area = 1/|F| ∑(t∈F) (A_t - Ā)²
-    """
-
-    is_torch: bool = False
-
-    def __init__(self):
-        super().__init__()
-        self.face_indices = None
-
-    def __str__(self):
-        return "TriangleAreaLoss"
-
-    def build_face_indices(self, faces: mi.UInt):
-        """Store face indices for area computation."""
-        faces_np = faces.numpy().reshape(-1, 3).astype(np.uint32)
-        self.face_i = mi.UInt(faces_np[:, 0])
-        self.face_j = mi.UInt(faces_np[:, 1])
-        self.face_k = mi.UInt(faces_np[:, 2])
-        self.num_faces = len(faces_np)
-
-    def __call__(self, vertices: mi.Float, faces: mi.UInt = None):
-        """
-        vertices: flattened vertex positions (num_vertices * 3,)
-        faces: flattened face indices (num_faces * 3,) - only needed for initialization
-        """
-        if self.face_indices is None:
-            if faces is None:
-                raise ValueError("Must provide faces for first call")
-            self.build_face_indices(faces)
-
-        verts = mi.Float(vertices)
-
-        # Compute all triangle areas
-        area_sum = mi.Float(0.0)
-
-        for idx in range(self.num_faces):
-            i = int(self.face_i[idx])
-            j = int(self.face_j[idx])
-            k = int(self.face_k[idx])
-
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-            v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-            v_k = mi.Vector3f(verts[k*3], verts[k*3+1], verts[k*3+2])
-
-            # Area = 0.5 * ||(v_j - v_i) × (v_k - v_i)||
-            edge1 = v_j - v_i
-            edge2 = v_k - v_i
-            cross_prod = dr.cross(edge1, edge2)
-            area = 0.5 * dr.norm(cross_prod)
-            area_sum += area
-
-        mean_area = area_sum / float(self.num_faces)
-
-        # Compute variance
-        variance = mi.Float(0.0)
-        for idx in range(self.num_faces):
-            i = int(self.face_i[idx])
-            j = int(self.face_j[idx])
-            k = int(self.face_k[idx])
-
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-            v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-            v_k = mi.Vector3f(verts[k*3], verts[k*3+1], verts[k*3+2])
-
-            edge1 = v_j - v_i
-            edge2 = v_k - v_i
-            cross_prod = dr.cross(edge1, edge2)
-            area = 0.5 * dr.norm(cross_prod)
-            diff = area - mean_area
-            variance += diff * diff
-
-        return variance / float(self.num_faces)
-
-    def lossfn(self, vertices: mi.Float, faces: mi.UInt = None):
-        return self(vertices, faces)
-
-
-class ARAPLoss(ModelMixin):
-    """
-    As-Rigid-As-Possible (ARAP) loss
-    Preserves original edge orientations by projecting deformed edges onto their initial directions.
-    ℒ_arap = 1/|E| ∑((i,j)∈E) ||(v_i - v_j) - proj_ê^(0)_ij(v_i - v_j)||²
-    """
-
-    is_torch: bool = False
-
-    def __init__(self):
-        super().__init__()
-        self.initial_edge_dirs = None
-        self.edge_i = None
-        self.edge_j = None
-
-    def __str__(self):
-        return "ARAPLoss"
-
-    def initialize(self, vertices: mi.Float, faces: mi.UInt):
-        """
-        Initialize with the rest pose (initial vertex positions).
-        This should be called once before optimization starts.
-        """
-        verts_np = vertices.numpy().reshape(-1, 3)
-        faces_np = faces.numpy().reshape(-1, 3).astype(np.int32)
-
-        # Extract unique edges
-        edges = set()
-        for face in faces_np:
-            i, j, k = face
-            edges.add(tuple(sorted([i, j])))
-            edges.add(tuple(sorted([j, k])))
-            edges.add(tuple(sorted([k, i])))
-
-        edges = list(edges)
-        self.num_edges = len(edges)
-
-        # Store edge indices
-        edge_array = np.array(edges, dtype=np.uint32)
-        self.edge_i = mi.UInt(edge_array[:, 0])
-        self.edge_j = mi.UInt(edge_array[:, 1])
-
-        # Compute and store initial edge directions (normalized)
-        initial_dirs = []
-        for i, j in edges:
-            edge_vec = verts_np[j] - verts_np[i]
-            edge_dir = edge_vec / (np.linalg.norm(edge_vec) + 1e-8)
-            initial_dirs.append(edge_dir)
-
-        initial_dirs = np.array(initial_dirs, dtype=np.float32).flatten()
-        self.initial_edge_dirs = mi.Float(initial_dirs)
-
-    def __call__(self, vertices: mi.Float, faces: mi.UInt = None):
-        """
-        vertices: flattened vertex positions (num_vertices * 3,)
-        faces: flattened face indices (only needed if not initialized)
-        """
-        if self.initial_edge_dirs is None:
-            if faces is None:
-                raise ValueError("Must call initialize() first or provide faces")
-            self.initialize(vertices, faces)
-            return mi.Float(0.0)
-
-        verts = mi.Float(vertices)
-
-        # Compute ARAP loss
-        total_loss = mi.Float(0.0)
-
-        for idx in range(self.num_edges):
-            i = int(self.edge_i[idx])
-            j = int(self.edge_j[idx])
-
-            # Current edge vector
-            v_i = mi.Vector3f(verts[i*3], verts[i*3+1], verts[i*3+2])
-            v_j = mi.Vector3f(verts[j*3], verts[j*3+1], verts[j*3+2])
-            edge_curr = v_j - v_i
-
-            # Initial edge direction
-            edge_init = mi.Vector3f(
-                self.initial_edge_dirs[idx*3],
-                self.initial_edge_dirs[idx*3+1],
-                self.initial_edge_dirs[idx*3+2]
-            )
-
-            # Project current edge onto initial direction
-            dot_prod = dr.dot(edge_curr, edge_init)
-            projection = edge_init * dot_prod
-
-            # Compute deviation from projection
-            deviation = edge_curr - projection
-            total_loss += dr.dot(deviation, deviation)
-
-        return total_loss / float(self.num_edges)
-
-    def lossfn(self, vertices: mi.Float, faces: mi.UInt = None):
-        return self(vertices, faces)
-
-
 class Model(Enum):
+    MSE = MSE
     MAE = MAE
     DUAL_BUFFER = DualBuffer
     DINO = DINO

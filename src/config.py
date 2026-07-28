@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
 from model import ModelMixin
@@ -13,8 +13,10 @@ class Config:
     envmap: str | None = None
     compute_forward: bool = False
     classify: bool = False
+    use_masks: bool = False
     spp: int | None = None
     seed: int | None = 42
+    baseline_rsa: bool = False
 
 
 @dataclass
@@ -68,7 +70,7 @@ class SuzanneConfig(GeometryConfig):
 class BSDFConfig:
     bsdf: dict | None = None
     params_to_optimize: list[str] | None = None
-    n_views: int = 4
+    n_views: int = 5
     lr: float = 3e-2
     epochs: int = 500
 
@@ -79,9 +81,9 @@ Translucent = BSDFConfig(
         "base_color": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+                 np.zeros((720, 480, 3))
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
         "eta": 1.64,
@@ -99,12 +101,13 @@ Translucent = BSDFConfig(
 Diffuse = BSDFConfig(
     bsdf={
         "type": "principled",
+        "specular": 0.0,
         "base_color": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+np.full((256, 256, 3), 0.5)
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
     },
@@ -116,20 +119,21 @@ Diffuse = BSDFConfig(
 BrushedMetal = BSDFConfig(
     bsdf={
         "type": "principled",
+        "metallic": 1.0,
         "base_color": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+np.full((256, 256, 3), 0.5)
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
         "anisotropic": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+np.zeros((256, 256, 3))
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
     },
@@ -139,12 +143,13 @@ BrushedMetal = BSDFConfig(
 Rosaline = BSDFConfig(
     bsdf={
         "type": "principled",
+        "sheen": 1.0,
         "base_color": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+np.full((256, 256, 3), 0.5)
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
     },
@@ -154,13 +159,14 @@ Rosaline = BSDFConfig(
 Aurora = BSDFConfig(
     bsdf={
         "type": "principled",
+        "clearcoat": 1.0,
         "anisotropic": 0.0,
         "base_color": {
             "type": "bitmap",
             "data": mi.TensorXf(
-                mi.Bitmap(np.zeros((480, 720, 3))).convert(
-                    mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32
-                )
+                mi.Bitmap(
+np.full((256, 256, 3), 0.5)
+                ).convert(mi.Bitmap.PixelFormat.RGB, mi.Struct.Type.Float32)
             ),
         },
     },

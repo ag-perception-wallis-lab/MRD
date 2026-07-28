@@ -2,25 +2,22 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
 from os import getenv
+from flip_evaluator import evaluate
 from gpytoolbox.remesh_botsch import remesh_botsch
 import drjit as dr
 import mitsuba as mi
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import kendalltau, spearmanr, pearsonr
+from sklearn.decomposition import PCA
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 
 from image_processing import linear_to_srgb_ldr
 
 mi.set_variant(getenv("DEFAULT_MI_VARIANT"))
-
-import numpy as np
-from sklearn.decomposition import PCA
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import wandb as wb
 
 
 def write_render_to_disk(img: mi.TensorXf, path: str) -> None:
@@ -133,11 +130,14 @@ def update_bsdf_parameter(opt: mi.ad.Adam):
 def compute_similarity(
     render: mi.TensorXf,
     target: mi.TensorXf | torch.Tensor,
-    model: nn.Module,
+    model: 'ModelMixin',
     verbose: bool = False,
     shape: tuple = (1, 3, 256, 256),
     crop: Callable = None,
-) -> float:
+    is_baseline: bool = False,
+    render_mask: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+) -> float | dict:
     """Computes the cosine similarity on a hypersphere.
     Only use this for models that are producing a latent space.
 
@@ -145,14 +145,26 @@ def compute_similarity(
         render: The current render.
         target: The target given the view.
         model: The model to produce the latent space with.
+        render_mask: Optional binary mask (1, 1, H, W) for the render — zeros
+            out background pixels of the current optimized shape.
+        target_mask: Optional binary mask (1, 1, H, W) for the target — zeros
+            out background pixels of the reference shape.
 
     Returns:
         The cosine similarity measured on an unit hypersphere.
     """
+    if is_baseline:
+        metrics = {}
+    sim = None
     render = render.torch().view(shape)
     if not torch.is_tensor(target):
         target = target.torch()
     target = target.view(shape)
+
+    if render_mask is not None:
+        render = render * render_mask
+    if target_mask is not None:
+        target = target * target_mask
 
     if crop:
         render = crop(render)
@@ -162,40 +174,47 @@ def compute_similarity(
     model_name = model.__class__.__name__
     if model_name in ("LPIPS", "LPIPSVGG"):
         sim = 1 - model.lossfn(render, target).numpy().flatten()
-        return float(sim)
 
     # CLIP and DINO are using cosine similarity loss
     # L(x, y) -> [0, 2]; lower is better
-    if model_name in ("DINO", "CLIPVision"):
+    elif model_name in ("DINO", "CLIPVision"):
         cossim_loss = model.lossfn(render, target).numpy()
         sim = 1 - cossim_loss
-        return float(sim)
 
-    latent = model(render).cpu()
-    target_latent = model(target).cpu()
+    else:
+        latent = model(render).cpu()
+        target_latent = model(target).cpu()
 
-    if model_name == "VGG":
-        # accumulates features throughout layers
-        latent = latent.view(1, -1)
-        target_latent = target_latent.view(1, -1)
+        if model_name == "VGG":
+            # accumulates features throughout layers
+            latent = latent.view(1, -1)
+            target_latent = target_latent.view(1, -1)
 
-    render_hypersphere = map_to_hypersphere(latent)
-    target_hypersphere = map_to_hypersphere(target_latent)
+        render_hypersphere = map_to_hypersphere(latent)
+        target_hypersphere = map_to_hypersphere(target_latent)
 
-    # Optional sanity checks during debugging
-    if verbose:
-        print(
-            render_hypersphere.norm(dim=-1).min().item(),
-            render_hypersphere.norm(dim=-1).max().item(),
-        )
-        print(
-            target_hypersphere.norm(dim=-1).min().item(),
-            target_hypersphere.norm(dim=-1).max().item(),
-        )
+        # Optional sanity checks during debugging
+        if verbose:
+            print(
+                render_hypersphere.norm(dim=-1).min().item(),
+                render_hypersphere.norm(dim=-1).max().item(),
+            )
+            print(
+                target_hypersphere.norm(dim=-1).min().item(),
+                target_hypersphere.norm(dim=-1).max().item(),
+            )
 
-    # It is safe to take the item, because the resulting shape should be 1x1.
-    sim = render_hypersphere @ target_hypersphere.T
-    sim = sim.squeeze().cpu().numpy()
+        # It is safe to take the item, because the resulting shape should be 1x1.
+        sim = render_hypersphere @ target_hypersphere.T
+        sim = sim.squeeze().cpu().numpy()
+
+    if is_baseline:
+        metrics[f'{model_name}/cosine'] = sim
+        if model_name not in ("LPIPS", "LPIPSVGG"):
+            metrics[f'{model_name}/pearson_latent'] = model.pearson(render, target)
+            metrics[f'{model_name}/spearman_latent'] = model.spearman(render, target)
+        return metrics
+
     return float(sim)
 
 
@@ -225,6 +244,15 @@ def manual_detachment(x: torch.Tensor) -> torch.Tensor:
 
     x.requires_grad = False
     return x.cpu()
+
+
+def cohens_d(group1, group2):
+    n1, n2 = len(group1), len(group2)
+    mean1, mean2 = np.mean(group1), np.mean(group2)
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    return (mean1 - mean2) / pooled_std
 
 
 def compute_pca(latent: torch.Tensor, return_model: bool = True) -> [PCA, np.ndarray]:
@@ -263,8 +291,10 @@ def refit_pca_and_project(latent: torch.Tensor, model: PCA) -> np.ndarray:
 def flat(x: list[torch.Tensor]):
     return torch.hstack([l.flatten() for l in x])
 
+
 def load_all_models() -> list:
     from model import ModelMixin, Resnet, ResnetSIN, LPIPSVGG, LPIPS, CLIPVision, DINO
+
     resnet = Resnet()
     resnet_sin = ResnetSIN()
     vgg = LPIPSVGG()
@@ -275,21 +305,25 @@ def load_all_models() -> list:
     return [resnet, resnet_sin, vgg, lpips, clip, dino]
 
 
-def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.ndim > 1:
-        x = x.squeeze()
-        y = y.squeeze()
-    x_mean = x.mean()
-    y_mean = y.mean()
-    cov = ((x - x_mean) * (y - y_mean)).mean()
-    std_x = x.std(unbiased=False)
-    std_y = y.std(unbiased=False)
-    return cov / (std_x * std_y)
+def pearson_correlation(x: torch.Tensor, y: torch.Tensor) -> np.ndarray:
+    """Pearson, can be either image or latent.
+
+    Args:
+        x (torch.Tensor): Latent or image
+        y (torch.Tensor): Latent or image
+
+    Returns:
+        np.ndarray: Pearson correlation
+    """
+    if torch.is_tensor(x):
+        x = x.cpu().numpy()
+    if torch.is_tensor(y):
+        y = y.cpu().numpy()
+
+    return pearsonr(x.flatten(), y.flatten()).correlation
 
 
-def spearman_correlation(
-    logits1: torch.Tensor, logits2: torch.Tensor, ties: bool = False
-) -> torch.Tensor:
+def spearman_correlation(x: torch.Tensor, y: torch.Tensor) -> np.ndarray:
     """
     Compute Spearman's rank correlation between two tensors of shape (1, N) or (N,).
 
@@ -300,33 +334,12 @@ def spearman_correlation(
     Returns:
         torch.Tensor: Scalar tensor representing the Spearman correlation.
     """
-    logits1 = logits1.squeeze()
-    logits2 = logits2.squeeze()
-    if logits1.ndim != 1:
-        logits1 = logits1.flatten()
-    if logits2.ndim != 1:
-        logits2 = logits2.flatten()
-    assert logits1.shape == logits2.shape and logits1.ndim == 1, (
-        "Inputs must be 1D and same shape after squeeze"
-    )
-    n = logits1.shape[0]
+    if torch.is_tensor(x):
+        x = x.cpu().numpy()
+    if torch.is_tensor(y):
+        y = y.cpu().numpy()
 
-    def rank_tensor(x):
-        sorted_indices = x.argsort(descending=True)
-        ranks = torch.zeros_like(x, dtype=torch.float)
-        ranks[sorted_indices] = torch.arange(
-            1, n + 1, dtype=torch.float, device=x.device
-        )
-        return ranks
-
-    rank1 = rank_tensor(logits1)
-    rank2 = rank_tensor(logits2)
-    if ties:
-        return pearson_correlation(rank1, rank2)
-
-    d = rank1 - rank2
-    spearman = 1 - 6 * torch.sum(d**2) / (n * (n**2 - 1))
-    return spearman
+    return spearmanr(x.flatten(), y.flatten()).correlation
 
 
 def to_minus1_1(x):
@@ -492,139 +505,20 @@ def forward_render(
 
     return [grad_img, mag, signed_grad]
 
-def exponential_decay(lr: float, epoch: int, decay: float = 5e-2):
-    """
-    Exponential decay for the learning rate.
-    """
-    return lr * (1 - decay) ** epoch
 
-def apply_new_lr(optimizer: mi.ad.Optimizer, epoch: int, warmup: int = 100):
-    if isinstance(optimizer.learning_rate(), float):
-        lr = {p: optimizer.lr for p in optimizer.keys()}
-    else:
-        lr = {p: optimizer.learning_rate(p) for p in optimizer.keys()}
-
-    #if warmup != 0 and epoch < warmup:
-    lr.pop('bsdf.base_color.data')
-
-    new_lr = {p: max(9e-2, exponential_decay(lr[p], epoch)) for p in lr.keys()}
+def apply_new_lr(optimizer: mi.ad.Optimizer, initial_lr: float, epoch: int, decay: float = 5e-2, min_lr: float = 1e-3):
+    """Exponential decay from initial_lr, applied uniformly to all parameters."""
+    decayed = max(min_lr, initial_lr * (1 - decay) ** epoch)
+    new_lr = {p: decayed for p in optimizer.keys()}
     optimizer.set_learning_rate(new_lr)
-    print('[INFO]\tNew learning rates set.')
-
-
-def create_local_output_dir(exp_name: str, seed: int | None = None) -> Path:
-    """
-    Creates a local output directory for storing progress images when wandb is not used.
-
-    Args:
-        exp_name: Name of the experiment
-        seed: Optional seed value to append to directory name
-
-    Returns:
-        Path to the created output directory
-    """
-    if seed:
-        exp_name += f'-{seed}'
-
-    output_dir = Path('./results') / exp_name
-    (output_dir / 'render').mkdir(parents=True, exist_ok=True)
-    (output_dir / 'render' / 'Step').mkdir(exist_ok=True)
-    (output_dir / 'render' / 'Pixel').mkdir(exist_ok=True)
-
-    return output_dir
-
-
-def save_progress_images(
-    output_dir: Path,
-    epoch: int,
-    image_grid: np.ndarray,
-    pixel_error_grid: np.ndarray | None = None,
-    grad_images: dict[str, np.ndarray] | None = None
-) -> None:
-    """
-    Saves progress images to disk during optimization when wandb is not used.
-
-    Args:
-        output_dir: Base output directory
-        epoch: Current epoch number
-        image_grid: Rendered image grid (HWC numpy array)
-        pixel_error_grid: Optional pixel error visualization (HWC numpy array)
-        grad_images: Optional dictionary of gradient visualizations
-    """
-    from PIL import Image
-
-    # Save rendered images
-    img = Image.fromarray((image_grid * 255).astype(np.uint8))
-    img.save(output_dir / 'render' / 'Step' / f'Step_{epoch:05d}.png')
-
-    # Save pixel error if provided
-    if pixel_error_grid is not None:
-        err_img = Image.fromarray(pixel_error_grid.astype(np.uint8))
-        err_img.save(output_dir / 'render' / 'Pixel' / f'Pixel_{epoch:05d}.png')
-
-    # Save gradient images if provided
-    if grad_images:
-        for name, grad_array in grad_images.items():
-            grad_dir = output_dir / 'grad' / name
-            grad_dir.mkdir(parents=True, exist_ok=True)
-            grad_img = Image.fromarray((grad_array * 255).astype(np.uint8))
-            grad_img.save(grad_dir / f'{name}_{epoch:05d}.png')
-
-
-def create_videos_from_local_images(
-    output_dir: Path, fps: int = 24, subdirs: dict[str, list[str]] | None = None
-) -> None:
-    """
-    Creates videos from locally saved images using ffmpeg.
-
-    Args:
-        output_dir: Base output directory containing the images
-        fps: Frames per second for the video
-        subdirs: Dictionary mapping category to list of prefixes (e.g., {"render": ["Step", "Pixel"]})
-    """
-    import subprocess
-    import glob
-
-    if subdirs is None:
-        subdirs = {"render": ["Pixel", "Step"]}
-
-    for k, v in subdirs.items():
-        for prefix in v:
-            pattern = str(output_dir / k / prefix / f"{prefix}_*.png")
-            files = glob.glob(pattern)
-
-            if not files:
-                print(f"No files found for pattern: {pattern}")
-                continue
-
-            output = str(output_dir / k / f"{prefix}.mp4")
-
-            cmd = [
-                "ffmpeg",
-                "-framerate",
-                str(fps),
-                "-pattern_type",
-                "glob",
-                "-i",
-                pattern,
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-y",  # Overwrite output file if it exists
-                output,
-            ]
-
-            print(f"Creating video: {output}")
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                print(f"Video created successfully: {output}")
-            except subprocess.CalledProcessError as e:
-                print(f"Failed to create video: {e.stderr.decode()}")
 
 
 def rename_log_files_and_create_video(
-    run: wb.Run, exp_name: str, fps: int = 24, record_texture: bool = False, seed: int | None = None
+    run: wandb.Run,
+    exp_name: str,
+    fps: int = 24,
+    record_texture: bool = False,
+    seed: int | None = None,
 ):
     """
     Cleans up the run's artifacts stored in Weights and Biases folder.
@@ -640,7 +534,7 @@ def rename_log_files_and_create_video(
 
     imgpath = f"{run.dir}/media/images/"
     # subdirs = {"grad": ["Image", "Magnitude", "Signed"], "render": ["Pixel", "Step"]}
-    subdirs = {"render": ["Pixel", "Step"]}
+    subdirs = {"render": ["Step", "FLIP"]}
     if record_texture:
         subdirs["render"].append("Texture")
 
@@ -677,9 +571,9 @@ def rename_log_files_and_create_video(
             subprocess.run(cmd, check=True)
 
     if seed:
-        exp_name += f'-{seed}'
+        exp_name += f"-{seed}"
 
-    res_path = Path('./results')
+    res_path = Path("./results")
 
     if not res_path.exists():
         res_path.mkdir()
@@ -701,19 +595,13 @@ def compute_rdm(X, metric="correlation"):
 
 
 def compute_rsa_similarity(
-    rdm_x: np.ndarray, rdm_y: np.ndarray, method: str = "kendall"
+    rdm_x: np.ndarray, rdm_y: np.ndarray, method: Callable = pearsonr
 ) -> list[np.ndarray]:
     i, j = np.triu_indices(rdm_x.shape[0], k=1)
     a = rdm_x[i, j]
     b = rdm_y[i, j]
 
-    if method == "spearman":
-        r, p = spearmanr(a, b)
-    elif method == "kendall":
-        r, p = kendalltau(a, b)
-    else:
-        r, p = pearsonr(a, b)
-
+    r, p = method(a, b)
     return r, p
 
 

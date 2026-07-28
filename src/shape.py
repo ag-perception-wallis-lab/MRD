@@ -1,30 +1,32 @@
-import pickle
 from typing import Any
 import drjit as dr
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mitsuba as mi
 import numpy as np
-from sklearn.decomposition import PCA
-from torchvision.transforms import CenterCrop
 from tqdm import tqdm
 import torch
 from torchvision.utils import make_grid
-from model import DEVICE, MAE, LaplacianLoss, EdgeLengthLoss, TriangleAreaLoss, ARAPLoss
-from plot import pixel_error, plot_rdm, plot_rsa_scatter
+from experiment_common import (
+    build_render_flip_grids,
+    compute_baseline_rsa,
+    compute_baseline_target_latents,
+    compute_flip_error,
+    compute_latent_rsa,
+    init_wandb_run,
+    record_baseline_metrics,
+    report_early_stop,
+    save_wandb_artifacts,
+    setup_baseline_models,
+)
 from utils import (
-    compute_rdm,
-    compute_rsa_similarity,
     compute_similarity,
     forward_render,
-    get_label,
-    load_all_models,
     remesh,
     EarlyStopping,
     EarlyStoppingConfig,
     rename_log_files_and_create_video,
-    create_local_output_dir,
-    save_progress_images,
-    create_videos_from_local_images,
 )
 from image_processing import linear_to_srgb_ldr
 from config import GeometryConfig, Config
@@ -32,11 +34,11 @@ from scenes import setup_views
 
 
 def reconstruct_geometry(
-        cfg: Config,
-        geom_cfg: GeometryConfig,
-        logs: dict[str, list],
-        wandb_project: str | None = None,
-        wandb_experiment_name: str | None = None,
+    cfg: Config,
+    geom_cfg: GeometryConfig,
+    logs: dict[str, dict[int, list]],
+    wandb_project: str | None = None,
+    wandb_experiment_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Reconstructs geometry based on configuration, logs, and optional integration with
@@ -62,27 +64,22 @@ def reconstruct_geometry(
         ValueError: If any invalid configuration values are set during execution.
         RuntimeError: If external library calls encounter issues like insufficient resources.
     """
-    if wandb_project and wandb_experiment_name:
+    wb_log = init_wandb_run(wandb_project, wandb_experiment_name, geom_cfg)
+    if wb_log:
         import wandb
-
-        # INFO: general config to store
-        config = geom_cfg
-        wb_log = wandb.init(
-            name=wandb_experiment_name, project=wandb_project, config=config
-        )
-        output_dir = None
-    else:
-        wb_log = None
-        # Create local output directory for saving progress images
-        # Use the experiment name that was passed in (includes scene-model-envmap)
-        output_dir = create_local_output_dir(
-            wandb_experiment_name, seed=cfg.seed
-        )
 
     is_baseline_run = cfg.model.__str__() == "MAE"
     is_torch = cfg.model.is_torch
-    has_cuda = mi.variant().startswith("cuda")
     scene = cfg.scene
+    if cfg.use_masks:
+        # depth > 0 for hits, 0 for background — works for any number of shapes.
+        # shape_index is 0-based so index 0 is indistinguishable from background.
+        # The depth AOV is appended after the nested integrator's RGB channels,
+        # so it sits at the last channel of the output tensor.
+        mask_integrator = mi.load_dict({
+            'type': 'aov',
+            'aovs': 'd:depth'
+        })
     scene["emitter"] = (
         dict(type="envmap", filename=cfg.envmap)
         if not isinstance(cfg.envmap, dict)  # constant case
@@ -91,36 +88,91 @@ def reconstruct_geometry(
     lr = geom_cfg.lr
 
     if is_baseline_run:
-        # More or less the question if we have enough VRAM
-        models = load_all_models()
-        similarities = {str(k): {m.__str__(): [] for m in models} for k in range(geom_cfg.n_views)}
+        models, baseline_history, rsa_models, rsa_model_names = setup_baseline_models()
 
-    if has_cuda:
-        denoiser = mi.OptixDenoiser(cfg.dims)
-
+    # Factor 2 because we use heldout views to evaluate the scores.
     sensors = setup_views(geom_cfg.n_views, width=cfg.dims[0], height=cfg.dims[1])
     target_scene = mi.load_dict(scene)  # pyright: ignore
 
     # render reference images
-    if has_cuda:
+    with dr.suspend_grad():
         ref_images = [
             linear_to_srgb_ldr(
                 mi.render(target_scene, sensor=sensors[i], spp=cfg.spp, seed=cfg.seed)
             )
             for i in range(geom_cfg.n_views)
         ]
-    else:
-        ref_images = [
-            mi.render(target_scene, sensor=sensors[i], spp=cfg.spp, seed=cfg.seed)
+
+        if cfg.use_masks:
+            ref_masks = [
+                mi.render(target_scene, sensor=sensors[i], integrator=mask_integrator)
+                for i in range(geom_cfg.n_views)
+            ]
+
+
+        # add 10 deg rotation around y-axis for heldout views
+        if 'to_world' in scene['shape']:
+            scene['shape']['to_world'] = scene['shape']['to_world'].rotate([0, 1, 0], 10)
+        else:
+            scene['shape']['to_world'] = mi.ScalarTransform4f.rotate([0, 1, 0], 10)
+        heldout_scene = mi.load_dict(scene)
+        heldout_views = [
+            linear_to_srgb_ldr(
+                mi.render(heldout_scene, sensor=sensors[i], spp=cfg.spp, seed=cfg.seed)
+            )
             for i in range(geom_cfg.n_views)
         ]
 
-    init_imgs = torch.stack(
-        [img.torch().permute(2, 0, 1).contiguous() for img in ref_images]
-    )
-    target_grid = make_grid(init_imgs, 5).permute(1, 2, 0).cpu().numpy()
+        if cfg.use_masks:
+            heldout_masks = [
+                mi.render(heldout_scene, sensor=sensors[i], integrator=mask_integrator)
+                for i in range(geom_cfg.n_views)
+            ]
+
+        init_imgs = torch.stack(
+            [img.torch().permute(2, 0, 1).contiguous() for img in ref_images]
+        )
+
+        heldout_imgs = torch.stack(
+            [img.torch().permute(2, 0, 1).contiguous() for img in heldout_views]
+        )
+
+        if cfg.use_masks:
+            # binary mask tensors per sensor: (1, 1, H, W) float, used to zero background
+            ref_mask_tensors = [
+                (m.torch()[..., -1:] > 0).float().permute(2, 0, 1).unsqueeze(0)
+                for m in ref_masks
+            ]
+            heldout_mask_tensors = [
+                (m.torch()[..., -1:] > 0).float().permute(2, 0, 1).unsqueeze(0)
+                for m in heldout_masks
+            ]
+            target_mask_grid = make_grid(
+                torch.cat(ref_mask_tensors, dim=0), 5
+            ).permute(1, 2, 0).cpu().numpy()
+
+        target_grid = make_grid(init_imgs, 5).permute(1, 2, 0).cpu().numpy()
+        heldout_grid = make_grid(heldout_imgs, 5).permute(1, 2, 0).cpu().numpy()
+
+        if cfg.baseline_rsa and is_baseline_run:
+            baseline_target_latent = compute_baseline_target_latents(
+                rsa_models, rsa_model_names, init_imgs, heldout_imgs,
+                img_masks=ref_mask_tensors if cfg.use_masks else None,
+                heldout_masks=heldout_mask_tensors if cfg.use_masks else None,
+            )
+
     if wb_log:
-        wb_log.log({"render/Target": wandb.Image(target_grid)})
+        static_images = {
+            "render/Target": wandb.Image(target_grid),
+            "render/Heldout": wandb.Image(heldout_grid),
+        }
+        if cfg.use_masks:
+            heldout_mask_grid = make_grid(
+                torch.stack([m.squeeze(0) for m in heldout_mask_tensors]), 5
+            ).permute(1, 2, 0).cpu().numpy()
+            static_images["render/Target Mask"] = wandb.Image(target_mask_grid)
+            static_images["render/Heldout Mask"] = wandb.Image(heldout_mask_grid)
+        wb_log.log(static_images)
 
     if is_torch:
         ref_images = [img.torch() for img in ref_images]
@@ -152,54 +204,59 @@ def reconstruct_geometry(
 
     optimizer = mi.ad.Adam(lr=geom_cfg.lr, uniform=True)
     optimizer["u"] = ls.to_differential(params["shape.vertex_positions"])
-    total_renders = []
 
-    # Initialize geometric regularization losses
-    geom_losses = {}
-    if geom_cfg.lambda_lap > 0:
-        geom_losses["laplacian"] = LaplacianLoss()
-        tqdm.write(f"Using Laplacian loss with λ={geom_cfg.lambda_lap}")
-    if geom_cfg.lambda_edge > 0:
-        geom_losses["edge"] = EdgeLengthLoss()
-        tqdm.write(f"Using Edge Length loss with λ={geom_cfg.lambda_edge}")
-    if geom_cfg.lambda_area > 0:
-        geom_losses["area"] = TriangleAreaLoss()
-        tqdm.write(f"Using Triangle Area loss with λ={geom_cfg.lambda_area}")
-    if geom_cfg.lambda_arap > 0:
-        geom_losses["arap"] = ARAPLoss()
-        # Initialize ARAP with initial vertex positions
-        geom_losses["arap"].initialize(
-            params["shape.vertex_positions"], params["shape.faces"]
-        )
-        tqdm.write(f"Using ARAP loss with λ={geom_cfg.lambda_arap}")
-
-    # Fit PCA over all latent representations. This requires the model to produce a latent representation.
+    # Should only fail for single runs for LPIPS and VGG.
     try:
         collect_latents = True
-        latents = [
-            cfg.model(render).detach().cpu().flatten().numpy() for render in ref_images
-        ]
-        target_latents = np.stack(latents[: geom_cfg.n_views])
         rsa = []
+        rsa_heldout = []
         sig = []
+        sig_heldout = []
+        if cfg.use_masks:
+            latents = [
+                cfg.model(
+                    (img.torch() if not torch.is_tensor(img) else img)
+                    .permute(2, 0, 1).unsqueeze(0) * ref_mask_tensors[i]
+                ).detach().cpu().flatten().numpy()
+                for i, img in enumerate(ref_images)
+            ]
+            heldout_latents = [
+                cfg.model(
+                    heldout_imgs[i].unsqueeze(0) * heldout_mask_tensors[i]
+                ).detach().cpu().flatten().numpy()
+                for i in range(geom_cfg.n_views)
+            ]
+            target_latents = np.stack(latents)
+            heldout_latents = np.stack(heldout_latents)
+        else:
+            latents = [
+                cfg.model(render).detach().cpu().flatten().numpy() for render in ref_images
+            ]
+            heldout_latents = [
+                cfg.model(render).detach().cpu().flatten().numpy() for render in heldout_imgs
+            ]
+            target_latents = np.stack(latents)
+            heldout_latents = np.stack(heldout_latents)
     except:
         collect_latents = False
 
     for epoch in tqdm(
-            range(geom_cfg.epochs), desc="Optimization", total=geom_cfg.epochs, unit="epoch"
+        range(geom_cfg.epochs), desc="Optimization", total=geom_cfg.epochs, unit="epoch"
     ):
         batch_loss = 0.0
         batch_sim = 0.0
         batch_renders = []
+        batch_render_masks = []
+        batch_flip = []
         if cfg.compute_forward:
             grad_renders = []
             mag_ldrs = []
             signed_ldrs = []
 
         remeshing = True if epoch in geom_cfg.remesh else False
-
         for sensor_idx, sensor in enumerate(sensors):
-            # visualize gradient
+            params["shape.vertex_positions"] = ls.from_differential(optimizer["u"])
+            params.update()
             if cfg.compute_forward:
                 with dr.isolate_grad():
                     grad, mag_grad, signed_grad = forward_render(
@@ -214,123 +271,87 @@ def reconstruct_geometry(
                 signed_ldrs.append(signed_grad)
 
             target = ref_images[sensor_idx]
-            params["shape.vertex_positions"] = ls.from_differential(optimizer["u"])
-            params.update()
+            heldout = heldout_imgs[sensor_idx]
 
             render = mi.render(
                 scene, params, sensor=sensor, spp=cfg.spp, seed=cfg.seed * sensor_idx
             )
+
+            if cfg.use_masks:
+                with dr.suspend_grad():
+                    mask = mi.render(
+                        scene, params, sensor, integrator=mask_integrator
+                    )
+                render_mask_tensor = (mask.torch()[..., -1:] > 0).float().permute(2, 0, 1).unsqueeze(0)
+                batch_render_masks.append(render_mask_tensor.squeeze(0))
+            else:
+                render_mask_tensor = None
+
             render = linear_to_srgb_ldr(render)
-            batch_renders.append(render.torch().permute(2, 0, 1).contiguous())
+            render_torch = render.torch().permute(2, 0, 1).contiguous()
+            batch_renders.append(render_torch)
             loss = cfg.model.lossfn(render, target)
-
-            # Run inference for each model and compute similarity
             if is_baseline_run:
-                with torch.no_grad():
-                    for model in models:
-                        crop = CenterCrop(224) if model.__class__.__name__ in ['DINO', 'CLIPVision'] else None
-                        sim = compute_similarity(
-                            render, target, model, shape=(1, 3, *cfg.dims), crop=crop
-                        )  # pyright: ignore
-                        similarities[str(sensor_idx)][model.__str__()].append(sim)
+                target = target.torch()
 
-            # Add geometric regularization losses
-            if geom_losses:
-                verts = params["shape.vertex_positions"]
-                faces = params["shape.faces"]
+            flip_err_map, flip_err = compute_flip_error(render, target)
+            batch_flip.append(flip_err_map)
 
-                if "laplacian" in geom_losses:
-                    lap_loss = geom_losses["laplacian"].lossfn(verts, faces)
-                    loss = loss + geom_cfg.lambda_lap * lap_loss
-
-                if "edge" in geom_losses:
-                    edge_loss = geom_losses["edge"].lossfn(verts, faces)
-                    loss = loss + geom_cfg.lambda_edge * edge_loss
-
-                if "area" in geom_losses:
-                    area_loss = geom_losses["area"].lossfn(verts, faces)
-                    loss = loss + geom_cfg.lambda_area * area_loss
-
-                if "arap" in geom_losses:
-                    arap_loss = geom_losses["arap"].lossfn(verts)
-                    loss = loss + geom_cfg.lambda_arap * arap_loss
-
-            # classify
-            if cfg.model.is_imagenet and wb_log and cfg.classify:
-                label = torch.tensor([geom_cfg.class_idx], device=DEVICE)
-                # introduce a weighting factor for the right class label
-                class_weights = torch.ones(1000, device=DEVICE) / 100
-                class_weights[geom_cfg.class_idx] = (
-                        class_weights[geom_cfg.class_idx] * 99
-                )
-                pred_loss, probs = cfg.model.classify(render, label, class_weights)
-                probs = probs.torch().detach()
-                with torch.no_grad():
-                    top_probs, top_idxs = probs.topk(5, dim=-1)
-                    top_probs = top_probs.squeeze().tolist()
-                    top_idxs = top_idxs.squeeze().tolist()
-                    top_labels = [get_label(i) for i in top_idxs]
-
-                table = wandb.Table(columns=["label", "probability"])
-                for label, probability in zip(top_labels, top_probs):
-                    table.add_data(label, probability)
-
-                barplot = wandb.plot.bar(
-                    table=table,
-                    label="label",
-                    value="probability",
-                    title="Top-5 classification",
-                )
-                # fig, ax = plt.subplots(figsize=(5, 3))
-                # ax.bar(range(len(top_labels)), top_probs)
-                # ax.set_xticks(range(len(top_labels)))
-                # ax.set_xticklabels(top_labels)  # , rotation=45, ha="right")
-                # ax.set_ylabel("Probability")
-                # ax.set_title("Top-5 probabilities")  # weighted loss components
-
-                reconstruction_loss = loss
-                loss = ((1 - geom_cfg.alpha) * pred_loss) + geom_cfg.alpha * loss
-                pred_log = {
-                    "Prediction/Probabilities": barplot,
-                    "Prediction/Loss": pred_loss.torch().item(),
-                    "Prediction/Reconstruction Loss": reconstruction_loss.torch().item(),
-                }
+            logs["flip"][sensor_idx].append(float(flip_err))
+            logs["loss"][sensor_idx].append(float(loss.torch().item()))
 
             dr.backward(loss)
             optimizer.step()
 
+            if is_baseline_run:
+                record_baseline_metrics(
+                    models, render, target, heldout, cfg, sensor_idx, baseline_history,
+                    render_mask=render_mask_tensor,
+                    target_mask=ref_mask_tensors[sensor_idx] if cfg.use_masks else None,
+                    heldout_mask=heldout_mask_tensors[sensor_idx] if cfg.use_masks else None,
+                )
+
             if collect_latents:
-                latents.append(cfg.model(render).detach().cpu().flatten().numpy())
+                render_chw = render.torch().permute(2, 0, 1).unsqueeze(0)
+                if cfg.use_masks and render_mask_tensor is not None:
+                    render_chw = render_chw * render_mask_tensor
+                else:
+                    latents.append(cfg.model(render_chw).detach().cpu().flatten().numpy())
 
-            batch_loss += loss.torch().item()
+            batch_loss += float(loss.torch().item())
 
-            # we can only compute similarity for model latent representations
-            # therefore we do not compute it for baselines (mean absolute) and
-            # LPIPS (is a similarity measure itself).
-            if not isinstance(cfg.model, MAE):
+            if not is_baseline_run:
                 sim = compute_similarity(
-                    render, target, cfg.model, shape=(1, 3, *cfg.dims)
+                    render, target, cfg.model, shape=(1, 3, *cfg.dims),
+                    render_mask=render_mask_tensor,
+                    target_mask=ref_mask_tensors[sensor_idx] if cfg.use_masks else None,
                 )  # pyright: ignore
+                logs["cosine"][sensor_idx].append(sim)
                 batch_sim += sim
+                sim = compute_similarity(
+                    render, heldout, cfg.model, shape=(1, 3, *cfg.dims),
+                    render_mask=render_mask_tensor,
+                    target_mask=heldout_mask_tensors[sensor_idx] if cfg.use_masks else None,
+                )  # pyright: ignore
+                logs['heldout/cosine'][sensor_idx].append(sim)
 
         if collect_latents:
-            current_latents = np.stack(latents[geom_cfg.n_views * (epoch + 1):])
-
-            rdm_latent = compute_rdm(current_latents)
-            rdm_target = compute_rdm(target_latents)
-            correlation, significance = compute_rsa_similarity(rdm_latent, rdm_target)
-            rdm_x_fig = plot_rdm(rdm_latent)
-            rdm_y_fig = plot_rdm(rdm_target)
-            rsa_fig = plot_rsa_scatter(rdm_latent, rdm_target)
-            rsa_log = {
-                "RSA/RDM Latent": rdm_x_fig,
-                "RSA/RDM Target": rdm_y_fig,
-                "RSA/RSA": rsa_fig,
-                "RSA/Correlation": correlation,
-                "RSA/Significance": significance,
-            }
+            current_latents = np.stack([
+                cfg.model(view * view_mask).detach().cpu().flatten().numpy()
+                for view, view_mask in zip(batch_renders, batch_render_masks)
+            ])
+            rsa_log, correlation, significance, heldout_corr, heldout_sig = compute_latent_rsa(
+                cfg.model, current_latents, target_latents, heldout_latents, geom_cfg.n_views, logs
+            )
             rsa.append(float(correlation))
             sig.append(float(significance))
+            rsa_heldout.append(float(heldout_corr))
+            sig_heldout.append(float(heldout_sig))
+
+        if cfg.baseline_rsa and is_baseline_run:
+            compute_baseline_rsa(
+                rsa_models, rsa_model_names, batch_renders, baseline_target_latent, baseline_history
+            )
 
         # remesh
         if remeshing:
@@ -349,59 +370,23 @@ def reconstruct_geometry(
             optimizer = mi.ad.Adam(lr=lr, uniform=True)
             optimizer["u"] = ls.to_differential(params["shape.vertex_positions"])
 
-            # Reinitialize geometric losses after remeshing (topology changed)
-            if "laplacian" in geom_losses:
-                geom_losses["laplacian"] = LaplacianLoss()
-            if "edge" in geom_losses:
-                geom_losses["edge"] = EdgeLengthLoss()
-            if "area" in geom_losses:
-                geom_losses["area"] = TriangleAreaLoss()
-            if "arap" in geom_losses:
-                geom_losses["arap"] = ARAPLoss()
-                geom_losses["arap"].initialize(
-                    params["shape.vertex_positions"], params["shape.faces"]
-                )
-
         # Epoch End
-        batch_renders = torch.stack(batch_renders)
-        image_grid = make_grid(batch_renders, 5, normalize=True, value_range=(0, 1))
-        image_grid = image_grid.permute(1, 2, 0).cpu().numpy()
-        total_renders.append(image_grid)
+        image_grid, flip_grid = build_render_flip_grids(batch_renders, batch_flip)
 
         tqdm.write(
             f"Epoch {epoch + 1} – Loss: {batch_loss / geom_cfg.n_views:.6f}, Similarity: {batch_sim / geom_cfg.n_views:.6f}"
         )
 
-        logs["loss"].append(batch_loss / geom_cfg.n_views)
-        logs["similarity"].append(batch_sim / geom_cfg.n_views)
-
-        # Prepare pixel error visualization for both wandb and local saving
-        pixel_diffs = []
-        for i, rndr in enumerate(batch_renders):
-            s = rndr.cpu().permute(1, 2, 0).numpy()  # HWC (RGB)
-            t = init_imgs[i, ...].cpu().permute(1, 2, 0).numpy()  # HWC (RGB)
-            err_np = pixel_error(s, t)  # HWC, uint8 (RGB)
-            pixel_diffs.append(torch.from_numpy(err_np))  # HWC uint8
-
-        # -> NCHW for make_grid
-        errs_nchw = torch.stack(
-            [img.permute(2, 0, 1) for img in pixel_diffs]
-        )  # (N,3,H,W)
-        grid_chw = make_grid(errs_nchw, nrow=5)  # (3, H_grid, W_grid)
-        diffs = grid_chw.permute(1, 2, 0).cpu().numpy()  # (H_grid, W_grid, 3)
-
-        # Process gradient visualizations (for both wandb and local saving)
-        if cfg.compute_forward:
-            grid_grad = make_grid(grad_renders, nrow=5)
-            grid_ldr = make_grid(
-                torch.stack(mag_ldrs), nrow=5
-            )  # (3, H_grid, W_grid)
-            grid_signed_ldr = make_grid(
-                torch.stack(signed_ldrs), nrow=5
-            )  # (3, H_grid, W_grid)
-
         if wb_log:
+            # tile
             if cfg.compute_forward:
+                grid_grad = make_grid(grad_renders, nrow=5)
+                grid_ldr = make_grid(
+                    torch.stack(mag_ldrs), nrow=5
+                )  # (3, H_grid, W_grid)
+                grid_signed_ldr = make_grid(
+                    torch.stack(signed_ldrs), nrow=5
+                )  # (3, H_grid, W_grid)
                 grad_log = {
                     "grad/Image": wandb.Image(grid_grad.permute(1, 2, 0).cpu().numpy()),
                     "grad/Magnitude LDR": wandb.Image(
@@ -412,40 +397,31 @@ def reconstruct_geometry(
                     ),
                 }
 
+            # -> HWC for wandb.Image
             images = {
                 "render/Step": wandb.Image(image_grid),
-                "render/Pixel Error": wandb.Image(diffs),
+                "render/FLIP Error": wandb.Image(flip_grid),
                 "Epoch": epoch,
             }
-            vals = {k: v[-1] for k, v in logs.items()}
+            if cfg.use_masks and batch_render_masks:
+                render_mask_grid = make_grid(
+                    torch.stack(batch_render_masks), 5
+                ).permute(1, 2, 0).cpu().numpy()
+                images["render/Mask"] = wandb.Image(render_mask_grid)
+            vals = dict()
+            for k, v in logs.items():
+                for kk, vv in v.items():
+                    vals[f"{k}/view_{kk}"] = vv[-1]
+
             vals.update(images)
             if collect_latents:
                 vals.update(rsa_log)
-
-            if cfg.model.is_imagenet and cfg.classify and wb_log:
-                vals.update(pred_log)
             if cfg.compute_forward:
                 vals.update(grad_log)
 
             wb_log.log(vals)
-            plt.close("all")
-        else:
-            # Save images locally when wandb is not enabled
-            grad_images = None
-            if cfg.compute_forward:
-                grad_images = {
-                    "Image": grid_grad.permute(1, 2, 0).cpu().numpy(),
-                    "Magnitude_LDR": grid_ldr.permute(1, 2, 0).cpu().numpy(),
-                    "Signed_LDR": grid_signed_ldr.permute(1, 2, 0).cpu().numpy(),
-                }
 
-            save_progress_images(
-                output_dir=output_dir,
-                epoch=epoch,
-                image_grid=image_grid,
-                pixel_error_grid=diffs,
-                grad_images=grad_images,
-            )
+        plt.close("all")
 
         should_stop = es.step(
             value=batch_loss / geom_cfg.n_views,
@@ -455,81 +431,16 @@ def reconstruct_geometry(
         )
 
         if should_stop:
-            print(
-                f"Early stopping triggered at epoch {epoch} "
-                f"(best @ epoch {es.best_epoch}, best={es.best:.6f})."
-            )
-            wb_log.log({'Best epoch': es.best_epoch})
+            report_early_stop(es, epoch)
+            if wb_log:
+                wb_log.log({"Best epoch": es.best_epoch})
             break
 
-    # write optimized mesh
-    # logs["scene"] = scene.shapes()[0].write_ply(f"{cfg.path}/optimized_mesh.ply")
-
-
     if wb_log:
-        if collect_latents:
-            pca = PCA(n_components=3)
-            latents = np.stack(latents)
-            pca.fit(np.stack(latents))
-
-            print("[PCA] EV Ratio: ", pca.explained_variance_ratio_)
-            Z = pca.transform(latents[geom_cfg.n_views:, ...])
-            Z_target = pca.transform(latents[: geom_cfg.n_views, ...])
-            with open(f"{wb_log.dir}/pca_latent.npy", "wb+") as f:
-                np.save(f, Z)
-            with open(f"{wb_log.dir}/pca_target.npy", "wb+") as f:
-                np.save(f, Z_target)
-            with open(f'{wb_log.dir}/rsa.npy', 'wb+') as f:
-                pickle.dump(rsa, f)
-            with open(f'{wb_log.dir}/rsa-sig.npy', 'wb+') as f:
-                pickle.dump(sig, f)
-
-        # Write similarities to file. This is only done for baseline runs to compute the ECDF.
-        if is_baseline_run:
-            with open(f'{wb_log.dir}/similarities.npy', 'wb+') as f:
-                pickle.dump(similarities, f)
-            with open(f'{wb_log.dir}/loss.npy', 'wb+') as f:
-                pickle.dump(logs['loss'], f)
-            with open(f'{wb_log.dir}/hypersphere.npy', 'wb+') as f:
-                pickle.dump(logs["similarity"], f)
-
+        save_wandb_artifacts(
+            wb_log, collect_latents, (rsa, sig, rsa_heldout, sig_heldout),
+            is_baseline_run, baseline_history,
+        )
         rename_log_files_and_create_video(wb_log, wandb_experiment_name, seed=None)
         wb_log.finish()
-    else:
-        # Create videos from locally saved images
-        print(f"Creating videos from saved images in {output_dir}...")
-        subdirs = {"render": ["Step", "Pixel"]}
-        if cfg.compute_forward:
-            subdirs["grad"] = ["Image", "Magnitude_LDR", "Signed_LDR"]
-        create_videos_from_local_images(output_dir, fps=24, subdirs=subdirs)
-
-        # Save final data
-        with open(f"{output_dir}/loss.npy", "wb+") as f:
-            pickle.dump(logs['loss'], f)
-        with open(f"{output_dir}/similarity.npy", "wb+") as f:
-            pickle.dump(logs["similarity"], f)
-
-        if collect_latents:
-            pca = PCA(n_components=3)
-            latents = np.stack(latents)
-            pca.fit(np.stack(latents))
-
-            print("[PCA] EV Ratio: ", pca.explained_variance_ratio_)
-            Z = pca.transform(latents[geom_cfg.n_views:, ...])
-            Z_target = pca.transform(latents[: geom_cfg.n_views, ...])
-            with open(f"{output_dir}/pca_latent.npy", "wb+") as f:
-                np.save(f, Z)
-            with open(f"{output_dir}/pca_target.npy", "wb+") as f:
-                np.save(f, Z_target)
-            with open(f'{output_dir}/rsa.npy', 'wb+') as f:
-                pickle.dump(rsa, f)
-            with open(f'{output_dir}/rsa-sig.npy', 'wb+') as f:
-                pickle.dump(sig, f)
-
-        if is_baseline_run:
-            with open(f'{output_dir}/similarities.npy', 'wb+') as f:
-                pickle.dump(similarities, f)
-
-        print(f"Results saved to: {output_dir}")
-
     return logs

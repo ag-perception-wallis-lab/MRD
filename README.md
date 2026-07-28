@@ -1,10 +1,7 @@
 # Metamers Rendered Differentiably (MRD)
 
-![](teaser.jpg)
-
 This is the repository accompanying our paper [*MRD: Using Physically Based Differentiable Rendering to Probe Vision Models for 3D Scene Understanding*](https://arxiv.org/abs/2512.12307).
 ```bibtex
-
 @misc{beilharz2025mrdusingphysicallybased,
       title={MRD: Using Physically Based Differentiable Rendering to Probe Vision Models for 3D Scene Understanding}, 
       author={Benjamin Beilharz and Thomas S. A. Wallis},
@@ -17,24 +14,29 @@ This is the repository accompanying our paper [*MRD: Using Physically Based Diff
 ```
 
 **The repository structure is as following:**
-- `src`: Yields all experiments and code to facilitate the optimization of metamers.
-- `vendor`: 3rd party repositories (modelsvshumans)
+- src: Yields all experiments and code to facilitate the optimization of metamers.
+  - `main.py`, `shape.py`, `bsdf.py`, `config.py`, `model.py`, `scenes.py`, `utils.py`, `image_processing.py`: core reconstruction pipeline.
+  - `experiment_common.py`: shared logging/rendering building blocks used by `shape.py` and `bsdf.py`.
+  - `bayes.py`: Bayesian/permutation-based inference (directional and rank Bayes factors, Monte Carlo permutation tests) used to test reconstruction similarity against baseline.
+  - `plot.py`, `ecdf.py`: plotting helpers and standalone script for ECDF/pixel-error figures.
+- vendor: 3rd party repositories that cannot be pip-installed (modelsvshumans)
+- plots: Contains all the figures of all experiments.
 
 ## Install
 
 ### Quick Setup (Recommended)
 Download the repo as usual with `git` or `gh`, then run the automated setup script:
 ```bash
-git clone https://github.com/ag-perception-wallis-lab/MRD
+git clone https://github.com/pixelsandpointers/MRD
 cd MRD
 ./setup.sh
 ```
 
 The setup script will automatically:
 - Update git submodules
-- Detect your GPU (sets `cuda` variant if NVIDIA GPU is found, otherwise `llvm_ad_rgb`)
+- Detect your GPU (sets `cuda_ad_rgb` variant if an NVIDIA GPU is found, otherwise `llvm_ad_rgb`. On MacOS defaults to `metal_ad_rgb` (supported since Mitsuba 3.9))
 - Configure the `.envrc` file with the appropriate variant
-- Extract the assets archive
+- Extract the assets archive (get `assets.tar.gz` from the [upstream repo](https://github.com/ag-perception-wallis-lab/MRD) and place it at the project root first — these are the same experiment assets, hosted there via git-lfs)
 - Install dependencies using `uv` (if available)
 
 After setup completes, source the environment:
@@ -52,12 +54,12 @@ If you prefer to set up manually:
 
 1. Pull the submodules: `git submodule update --init --recursive`
 
-2. Extract the assets archive:
+2. Get `assets.tar.gz` from the [upstream repo](https://github.com/ag-perception-wallis-lab/MRD) (same experiment assets, hosted there via git-lfs), place it at the project root, and extract it:
 ```bash
 tar -xzf assets.tar.gz
 ```
 
-3. Configure environment variables by sourcing `.envrc` (set `DEFAULT_MI_VARIANT` to `cuda` if you have an NVIDIA GPU, otherwise `llvm_ad_rgb`)
+3. Configure environment variables by sourcing `.envrc` (set `DEFAULT_MI_VARIANT` to `cuda_ad_rgb` if you have an NVIDIA GPU, otherwise `llvm_ad_rgb`)
 
 4. Get the project up and running by using `uv sync` or using the `pyproject.toml` as an installation target with `pip install .` (use `-e` if you intend to modify).
 
@@ -69,15 +71,15 @@ Generally, you would start an experiment by evoking `src/main.py` (we expect you
 
 
 ```bash
-usage: main.py [-h] [-p PATH] [--spp SPP] [--seed SEED] [-e EPOCHS] [-d DIMS] [-n NVIEWS] [--lr LR] [--forward] [--classify] [-l L] [--remesh REMESH] [--wandb] [--wandb-name WANDB_NAME] [--wandb-project WANDB_PROJECT]
-               {dragon,dog,lion,lionstatue,suzanne,translucent,diffuse,brushed_metal,rosaline,aurora} {hallstatt,skybox,garden,constant} {mae,dual_buffer,dino,clip,resnet,resnet_sin,vggloss,lpips,vgg}
+usage: main.py [-h] [--spp SPP] [--seed SEED] [-e EPOCHS] [-d DIMS] [-n NVIEWS] [--lr LR] [--forward] [--classify] [--mask] [--baseline-rsa] [-l L] [--remesh REMESH] [--wandb] [--wandb-name WANDB_NAME] [--wandb-project WANDB_PROJECT]
+               {dragon,dog,lion,lionstatue,suzanne,translucent,diffuse,brushed_metal,rosaline,aurora} {hallstatt,skybox,garden,constant} {mse,mae,dual_buffer,dino,clip,resnet,resnet_sin,vggloss,lpips,vgg}
 
 positional arguments:
   {dragon,dog,lion,lionstatue,suzanne,translucent,diffuse,brushed_metal,rosaline,aurora}
                         The scene to load.
   {hallstatt,skybox,garden,constant}
                         The environment map to load.
-  {mae,dual_buffer,dino,clip,resnet,resnet_sin,vggloss,lpips,vgg}
+  {mse,mae,dual_buffer,dino,clip,resnet,resnet_sin,vggloss,lpips,vgg}
                         Specify the model used for the reconstruction.
 
 options:
@@ -94,6 +96,8 @@ Experiment Settings:
   --lr LR                       Learning rate
   --forward                     Whether to compute and visualize the forward gradients (requires Wandb logging).
   --classify                    Whether to use a classification loss for ResNets.
+  --mask                        Whether to use shape masks when computing similarity and correlation (excludes background pixels).
+  --baseline-rsa                Compute and write RSA files during baseline runs using DINO latents.
 
 Shape experiment:
   These are parameters only relevant for the shape reconstruction.
@@ -121,78 +125,3 @@ To add a model, you derive from `ModelMixin` in `src/model.py` and implement the
 If you use PyTorch for your model, please make sure to decorate the `lossfn` with `@dr.wrap('drjit', 'torch')`. This way DrJit will automatically merge PyTorch's autodiff graph with its own and enables backprop through the whole pipeline.
 
 Please add the model to the `Model` enum to use it with `src/main.py`.
-
-## Geometric Regularization Losses 
-
-This implementation adds four geometric regularization losses. (Not used in the experiments).
-
-### Implementation Details
-- All losses are **differentiable** using DrJit operations
-- Losses are automatically initialized on first use
-- After remeshing, losses are reinitialized with the new topology
-- Set any `lambda_*` to `0.0` to disable that loss
-- ARAP loss stores initial edge directions from the starting mesh
-
-### Available Losses
-1. **Laplacian Loss** (`lambda_lap`): Penalizes deviations of vertices from the mean of their neighbors (smoothness)
-2. **Edge Length Loss** (`lambda_edge`): Enforces uniform edge lengths by penalizing variance
-3. **Triangle Area Loss** (`lambda_area`): Enforces uniform triangle areas by penalizing variance
-4. **ARAP Loss** (`lambda_arap`): Preserves original edge orientations (As-Rigid-As-Possible)
-
-### Usage
-#### 1. Set regularization weights in GeometryConfig
-
-```python
-from config import GeometryConfig
-
-# Create a custom config with regularization
-config = GeometryConfig(
-    n_views=25,
-    lambda_reg=15,      # Existing regularization parameter
-    lr=1e-1,
-    remesh=[5, 25, 50, 100, 150, 250, 350, 450],
-    epochs=500,
-    # New geometric regularization parameters
-    lambda_lap=0.1,     # Laplacian smoothness
-    lambda_edge=0.05,   # Uniform edge lengths
-    lambda_area=0.05,   # Uniform triangle areas
-    lambda_arap=0.1,    # As-Rigid-As-Possible
-)
-```
-
-#### 2. Use with shape reconstruction
-
-```python
-from config import Config, GeometryConfig
-from model import DINO
-from shape import reconstruct_geometry
-
-# Setup main config
-cfg = Config(
-    dims=[256, 256],
-    model=DINO(),
-    scene=your_scene_dict,
-    envmap="path/to/envmap.exr",
-    spp=32
-)
-
-# Setup geometry config with regularization
-geom_cfg = GeometryConfig(
-    n_views=25,
-    lambda_reg=15,
-    lr=1e-1,
-    remesh=[100, 200, 300],
-    lambda_lap=0.1,    # Enable Laplacian smoothing
-    lambda_area=0.05,  # Enable area uniformity
-)
-
-# Run reconstruction with regularization
-logs = reconstruct_geometry(
-    cfg=cfg,
-    geom_cfg=geom_cfg,
-    logs={"loss": [], "similarity": []},
-    wandb_project="my_project",
-    wandb_experiment_name="shape_with_regularization"
-)
-```
-

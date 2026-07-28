@@ -1,5 +1,7 @@
 from argparse import ArgumentParser
 from collections import defaultdict
+import os
+import pickle
 
 from bsdf import reconstruct_bsdf
 from config import (
@@ -16,7 +18,7 @@ from config import (
     Translucent,
 )
 from model import DINO, CLIPVision, Model
-from scenes import Envmap, Scene
+from scenes import Scene, Envmap
 from shape import GeometryConfig, reconstruct_geometry
 
 
@@ -49,7 +51,7 @@ def main():
         "--spp", type=int, default=64, help="The number per samples for each pixel."
     )
 
-    experiment.add_argument("--seed", type=int, default=42, help="The seed to use.")
+    experiment.add_argument("--seed", type=int, default=None, help="The seed to use.")
 
     experiment.add_argument(
         "-e",
@@ -85,6 +87,16 @@ def main():
         "--classify",
         action="store_true",
         help="Whether to use a classification loss for ResNets.",
+    )
+    experiment.add_argument(
+        "--mask",
+        action="store_true",
+        help="Whether to use shape masks when computing similarity and correlation (excludes background pixels).",
+    )
+    experiment.add_argument(
+        "--baseline-rsa",
+        action="store_true",
+        help="Compute and write RSA files during baseline runs using DINO latents.",
     )
 
     shape = parser.add_argument_group(
@@ -137,11 +149,13 @@ def main():
         envmap,
         args.forward,
         args.classify,
+        args.mask,
         args.spp,
-        seed=args.seed,
+        args.seed if args.seed is not None else 42,
+        args.baseline_rsa,
     )
-    run = reconstruct_geometry if is_shape_exp else reconstruct_bsdf
 
+    run = reconstruct_geometry if is_shape_exp else reconstruct_bsdf
     # setup shape scene
     if is_shape_exp:
         match args.scene:
@@ -172,6 +186,8 @@ def main():
                 exp_cfg = Diffuse
             case "brushed_metal":
                 exp_cfg = BrushedMetal
+            case "rosaline":
+                exp_cfg = Rosaline
             case "aurora":
                 exp_cfg = Aurora
 
@@ -187,20 +203,25 @@ def main():
     if args.nviews:
         exp_cfg.n_views = args.nviews
 
-    logs = defaultdict(list)
-    # Always create an experiment name for both wandb and local saving
-    experiment_name = (
-        f"{args.scene}-{args.model}-{args.envmap}"
-        if not args.wandb_name
-        else args.wandb_name
-    )
-    if not is_shape_exp:
-        experiment_name = experiment_name.replace(f"-{args.envmap}", "")
-
+    logs = defaultdict(lambda: defaultdict(list))
+    experiment_name = f"{args.scene}-{args.model}-{args.envmap}"
     if args.wandb:
+        if not args.wandb_name:
+            experiment_name = f"{args.scene}-{args.model}-{args.envmap}"
+            if is_shape_exp and args.seed is not None:
+                experiment_name += f"_seed{args.seed}"
+        else:
+            experiment_name = args.wandb_name
+        if not is_shape_exp:
+            experiment_name = experiment_name.replace(f"-{args.envmap}", "")
         res = run(cfg, exp_cfg, logs, args.wandb_project, experiment_name)  # type: ignore
     else:
-        res = run(cfg, exp_cfg, logs, None, experiment_name)  # type: ignore
+        res = run(cfg, exp_cfg, logs)  # type: ignore
+
+    if not args.wandb_name:
+        os.mkdir(f"./results/{experiment_name}")
+        with open(f"./results/{experiment_name}/metrics.pickle", "wb+") as fp:
+            pickle.dump(dict(res), fp)
 
 
 if __name__ == "__main__":

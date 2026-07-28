@@ -1,11 +1,9 @@
 from enum import Enum
-
 import drjit as dr
 import mitsuba as mi
 
 T = mi.ScalarTransform4f()
 MAX_BOUNCES = 10
-
 
 def sample_camera_positions(number_of_views: int = 8, distance: int = 5) -> list[int]:
     """Samples camera origins around an object, on the Fibonacci lattice.
@@ -84,6 +82,21 @@ dragon_scene = {
     },
 }
 
+lion_scene = {
+    "type": "scene",
+    "integrator": {
+        "type": "direct_projective",
+    },
+    "emitter": "constant",
+    "shape": {
+        "type": "ply",
+        "filename": "./assets/models/lion.ply",
+        "bsdf": {
+            "type": "diffuse",
+        },
+    },
+}
+
 dog_scene = {
     "type": "scene",
     "integrator": {
@@ -132,7 +145,7 @@ translucent = {
     "integrator": {
         "type": "path",
         "max_depth": 12,
-        # "rr_depth": 5,
+        #"rr_depth": 5,
     },
     "film": {
         "type": "hdrfilm",
@@ -215,6 +228,23 @@ translucent = {
         "to_world": mi.ScalarTransform4f.translate([-10.0, 2.0, 0.0])
         .rotate([0, 1, 0], 90.00000250447816)
         .rotate([1, 0, 0], -2.504477861932166e-06),
+        "sampler": {
+            "type": "independent",
+            "sample_count": 256,
+        },
+        "film": {"type": "ref", "id": "film"},
+    },
+    "sensor_top": {
+        "type": "perspective",
+        "fov_axis": "x",
+        "fov": 39.597755,
+        "near_clip": 0.1,
+        "far_clip": 1000.0,
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 13, 0],
+            target=[0, 0, 0],
+            up=[0, 0, 1],
+        ),
         "sampler": {
             "type": "independent",
             "sample_count": 256,
@@ -331,16 +361,6 @@ diffuse = {
         },
         "film": {"type": "ref", "id": "film"},
     },
-    "point_light": {
-        "type": "point",
-        "to_world": mi.ScalarTransform4f.translate([10.0, 2.0, 0.0])
-        .rotate([0, 1, 0], -90.00000250447816)
-        .rotate([1, 0, 0], 360.00001001791264),
-        "intensity": {
-            "type": "spectrum",
-            "value": 100.0,
-        },
-    },
     "sensor_left": {
         "type": "perspective",
         "fov_axis": "x",
@@ -352,6 +372,23 @@ diffuse = {
         "to_world": mi.ScalarTransform4f.translate([-10.0, 2.0, 0.0])
         .rotate([0, 1, 0], 90.00000250447816)
         .rotate([1, 0, 0], -2.504477861932166e-06),
+        "sampler": {
+            "type": "independent",
+            "sample_count": 256,
+        },
+        "film": {"type": "ref", "id": "film"},
+    },
+    "sensor_top": {
+        "type": "perspective",
+        "fov_axis": "x",
+        "fov": 39.597755,
+        "near_clip": 0.1,
+        "far_clip": 1000.0,
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 13, 0],
+            target=[0, 0, 0],
+            up=[0, 0, 1],
+        ),
         "sampler": {
             "type": "independent",
             "sample_count": 256,
@@ -465,16 +502,6 @@ brushed_metal = {
         },
         "film": {"type": "ref", "id": "film"},
     },
-    "point_light": {
-        "type": "point",
-        "to_world": mi.ScalarTransform4f.translate([10.0, 2.0, 0.0])
-        .rotate([0, 1, 0], -90.00000250447816)
-        .rotate([1, 0, 0], 360.00001001791264),
-        "intensity": {
-            "type": "spectrum",
-            "value": 100.0,
-        },
-    },
     "sensor_left": {
         "type": "perspective",
         "fov_axis": "x",
@@ -486,6 +513,23 @@ brushed_metal = {
         "to_world": mi.ScalarTransform4f.translate([-10.0, 2.0, 0.0])
         .rotate([0, 1, 0], 90.00000250447816)
         .rotate([1, 0, 0], -2.504477861932166e-06),
+        "sampler": {
+            "type": "independent",
+            "sample_count": 256,
+        },
+        "film": {"type": "ref", "id": "film"},
+    },
+    "sensor_top": {
+        "type": "perspective",
+        "fov_axis": "x",
+        "fov": 39.597755,
+        "near_clip": 0.1,
+        "far_clip": 1000.0,
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 13, 0],
+            target=[0, 0, 0],
+            up=[0, 0, 1],
+        ),
         "sampler": {
             "type": "independent",
             "sample_count": 256,
@@ -596,16 +640,6 @@ rosaline = {
         },
         "film": {"type": "ref", "id": "film"},
     },
-    "point_light": {
-        "type": "point",
-        "to_world": mi.ScalarTransform4f.translate([10.0, 2.0, 0.0])
-        .rotate([0, 1, 0], -90.00000250447816)
-        .rotate([1, 0, 0], 360.00001001791264),
-        "intensity": {
-            "type": "spectrum",
-            "value": 100.0,
-        },
-    },
     "sensor_left": {
         "type": "perspective",
         "fov_axis": "x",
@@ -617,6 +651,23 @@ rosaline = {
         "to_world": mi.ScalarTransform4f.translate([-10.0, 2.0, 0.0])
         .rotate([0, 1, 0], 90.00000250447816)
         .rotate([1, 0, 0], -2.504477861932166e-06),
+        "sampler": {
+            "type": "independent",
+            "sample_count": 256,
+        },
+        "film": {"type": "ref", "id": "film"},
+    },
+    "sensor_top": {
+        "type": "perspective",
+        "fov_axis": "x",
+        "fov": 39.597755,
+        "near_clip": 0.1,
+        "far_clip": 1000.0,
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 13, 0],
+            target=[0, 0, 0],
+            up=[0, 0, 1],
+        ),
         "sampler": {
             "type": "independent",
             "sample_count": 256,
@@ -727,16 +778,6 @@ northern_aurora = {
         },
         "film": {"type": "ref", "id": "film"},
     },
-    "point_light": {
-        "type": "point",
-        "to_world": mi.ScalarTransform4f.translate([10.0, 2.0, 0.0])
-        .rotate([0, 1, 0], -90.00000250447816)
-        .rotate([1, 0, 0], 360.00001001791264),
-        "intensity": {
-            "type": "spectrum",
-            "value": 100.0,
-        },
-    },
     "sensor_left": {
         "type": "perspective",
         "fov_axis": "x",
@@ -748,6 +789,23 @@ northern_aurora = {
         "to_world": mi.ScalarTransform4f.translate([-10.0, 2.0, 0.0])
         .rotate([0, 1, 0], 90.00000250447816)
         .rotate([1, 0, 0], -2.504477861932166e-06),
+        "sampler": {
+            "type": "independent",
+            "sample_count": 256,
+        },
+        "film": {"type": "ref", "id": "film"},
+    },
+    "sensor_top": {
+        "type": "perspective",
+        "fov_axis": "x",
+        "fov": 39.597755,
+        "near_clip": 0.1,
+        "far_clip": 1000.0,
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 13, 0],
+            target=[0, 0, 0],
+            up=[0, 0, 1],
+        ),
         "sampler": {
             "type": "independent",
             "sample_count": 256,
@@ -796,6 +854,7 @@ class Scene(Enum):
     # Shape
     DRAGON = dragon_scene
     DOG = dog_scene
+    LION = lion_scene
     LIONSTATUE = lion_statue_scene
     SUZANNE = suzanne_scene
 
@@ -803,6 +862,7 @@ class Scene(Enum):
     TRANSLUCENT = translucent
     DIFFUSE = diffuse
     BRUSHED_METAL = brushed_metal
+    ROSALINE = rosaline
     AURORA = northern_aurora
 
 
